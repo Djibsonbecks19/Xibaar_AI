@@ -2,6 +2,6 @@ fastapi
 uvicorn
 requests
 python-dotenv
-elasticsearch
-psycopg2-binary
 websockets
+elasticsearch
+psycopg2-binary==2.9.9

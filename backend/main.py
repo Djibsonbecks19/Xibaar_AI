@@ -1,26 +1,22 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from elasticsearch import Elasticsearch
 from dotenv import load_dotenv
-import psycopg2
+from elasticsearch import Elasticsearch
 import os
-import datetime
 import uuid
 
+# =========================
+# LOAD ENV
+# =========================
 load_dotenv()
 
-# ==================================================
-# CONFIG
-# ==================================================
+ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL")
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-# ==================================================
+# =========================
 # APP
-# ==================================================
-
+# =========================
 app = FastAPI(title="XIBAAR AI")
 
 app.add_middleware(
@@ -31,42 +27,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==================================================
-# DATABASE
-# ==================================================
+# =========================
+# SAFE OPTIONAL IMPORTS
+# =========================
+try:
+    import psycopg2
+except Exception as e:
+    print("psycopg2 not available:", e)
+    psycopg2 = None
 
-conn = psycopg2.connect(DATABASE_URL)
-cur = conn.cursor()
+# =========================
+# SAFE ELASTICSEARCH INIT
+# =========================
+es = None
+try:
+    if ELASTICSEARCH_URL:
+        es = Elasticsearch(ELASTICSEARCH_URL)
+except Exception as e:
+    print("Elasticsearch init failed:", e)
+    es = None
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS incidents (
-    id TEXT PRIMARY KEY,
-    type TEXT,
-    source_ip TEXT,
-    severity TEXT,
-    blocked BOOLEAN,
-    timestamp TEXT
-)
-""")
+# =========================
+# DB SAFE CONNECT
+# =========================
+def get_db():
+    if not DATABASE_URL or not psycopg2:
+        return None
+    try:
+        return psycopg2.connect(DATABASE_URL)
+    except Exception as e:
+        print("DB connection failed:", e)
+        return None
 
-conn.commit()
+# =========================
+# WEBSOCKETS
+# =========================
+clients = set()
 
-# ==================================================
-# ELASTICSEARCH
-# ==================================================
-
-es = Elasticsearch(ELASTICSEARCH_URL)
-
-# ==================================================
-# WEBSOCKET CLIENTS
-# ==================================================
-
-clients = []
-
-# ==================================================
+# =========================
 # MODELS
-# ==================================================
-
+# =========================
 class EventModel(BaseModel):
     type: str
     source_ip: str
@@ -77,145 +77,169 @@ class EventModel(BaseModel):
 class ChatRequest(BaseModel):
     text: str
 
-# ==================================================
+# =========================
 # ROOT
-# ==================================================
-
+# =========================
 @app.get("/")
 def root():
     return {
         "status": "XIBAAR AI running",
-        "elasticsearch": es.ping()
+        "elasticsearch": bool(es and hasattr(es, "ping") and es.ping())
     }
 
-# ==================================================
-# EVENTS
-# ==================================================
-
+# =========================
+# CREATE EVENT
+# =========================
 @app.post("/api/events")
 async def create_event(event: EventModel):
 
     data = event.dict()
 
-    # Save to Elasticsearch
-    es.index(index="xibaar-events", document=data)
+    # ELASTIC SAFE
+    if es:
+        try:
+            es.index(index="xibaar-events", document=data)
+        except Exception as e:
+            print("Elastic insert error:", e)
 
-    # Auto incident creation for HIGH severity
-    if data["severity"] == "HIGH":
+    # POSTGRES SAFE
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
 
-        incident_id = str(uuid.uuid4())
+            if data["severity"] == "HIGH":
+                incident_id = str(uuid.uuid4())
 
-        cur.execute("""
-        INSERT INTO incidents
-        VALUES (%s,%s,%s,%s,%s,%s)
-        """, (
-            incident_id,
-            data["type"],
-            data["source_ip"],
-            data["severity"],
-            False,
-            data["timestamp"]
-        ))
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS incidents (
+                        id TEXT PRIMARY KEY,
+                        type TEXT,
+                        source_ip TEXT,
+                        severity TEXT,
+                        blocked BOOLEAN,
+                        timestamp TEXT
+                    )
+                """)
 
-        conn.commit()
+                cur.execute("""
+                    INSERT INTO incidents VALUES (%s,%s,%s,%s,%s,%s)
+                """, (
+                    incident_id,
+                    data["type"],
+                    data["source_ip"],
+                    data["severity"],
+                    False,
+                    data["timestamp"]
+                ))
 
-    # Realtime websocket broadcast
-    disconnected = []
+                conn.commit()
+
+        except Exception as e:
+            print("DB ERROR:", e)
+
+        finally:
+            conn.close()
+
+    # WEBSOCKET BROADCAST
+    dead = set()
 
     for client in clients:
         try:
             await client.send_json({
                 "type": "new_event",
-                "data": data
+                "event": data
             })
         except:
-            disconnected.append(client)
+            dead.add(client)
 
-    for d in disconnected:
-        clients.remove(d)
+    for d in dead:
+        clients.discard(d)
 
     return {"ok": True}
 
-# ==================================================
-# GET EVENTS
-# ==================================================
-
+# =========================
+# GET EVENTS (ELASTIC)
+# =========================
 @app.get("/api/events")
 def get_events():
 
+    if not es:
+        return []
+
     try:
-        results = es.search(
-            index="xibaar-events",
-            size=100,
-            sort=[{"timestamp": {"order": "desc"}}]
-        )
+        results = es.search(index="xibaar-events", size=50)
+        return [hit["_source"] for hit in results["hits"]["hits"]]
+    except:
+        return []
 
-        return [
-            hit["_source"]
-            for hit in results["hits"]["hits"]
-        ]
-
-    except Exception as e:
-        return {
-            "error": str(e)
-        }
-
-# ==================================================
-# INCIDENTS
-# ==================================================
-
+# =========================
+# INCIDENTS (POSTGRES)
+# =========================
 @app.get("/api/incidents")
 def get_incidents():
 
-    cur.execute("""
-    SELECT * FROM incidents
-    ORDER BY timestamp DESC
-    """)
+    conn = get_db()
+    if not conn:
+        return []
 
-    rows = cur.fetchall()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM incidents ORDER BY timestamp DESC")
+        rows = cur.fetchall()
 
-    data = []
+        return [
+            {
+                "id": r[0],
+                "type": r[1],
+                "source_ip": r[2],
+                "severity": r[3],
+                "blocked": r[4],
+                "timestamp": r[5]
+            }
+            for r in rows
+        ]
 
-    for row in rows:
-        data.append({
-            "id": row[0],
-            "type": row[1],
-            "source_ip": row[2],
-            "severity": row[3],
-            "blocked": row[4],
-            "timestamp": row[5]
-        })
+    except Exception as e:
+        print("Incidents error:", e)
+        return []
 
-    return data
+    finally:
+        conn.close()
 
-# ==================================================
+# =========================
 # STATS
-# ==================================================
-
+# =========================
 @app.get("/api/stats")
 def stats():
 
-    cur.execute("SELECT COUNT(*) FROM incidents")
-    total_incidents = cur.fetchone()[0]
+    total_incidents = critiques = ips_bloquees = 0
 
-    try:
-        total_events = es.count(index="xibaar-events")["count"]
-    except:
-        total_events = 0
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
 
-    cur.execute("""
-    SELECT COUNT(*)
-    FROM incidents
-    WHERE severity='HIGH'
-    """)
-    critiques = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM incidents")
+            total_incidents = cur.fetchone()[0]
 
-    cur.execute("""
-    SELECT COUNT(*)
-    FROM incidents
-    WHERE blocked=true
-    """)
-    ips_bloquees = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM incidents WHERE severity='HIGH'")
+            critiques = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM incidents WHERE blocked=true")
+            ips_bloquees = cur.fetchone()[0]
+
+        except:
+            pass
+        finally:
+            conn.close()
+
+    total_events = 0
+    if es:
+        try:
+            total_events = es.count(index="xibaar-events")["count"]
+        except:
+            pass
 
     return {
         "total_incidents": total_incidents,
@@ -224,74 +248,50 @@ def stats():
         "ips_bloquees": ips_bloquees
     }
 
-# ==================================================
+# =========================
 # BLOCK IP
-# ==================================================
-
+# =========================
 @app.post("/api/block-ip/{ip}")
 def block_ip(ip: str):
 
-    cur.execute("""
-    UPDATE incidents
-    SET blocked=true
-    WHERE source_ip=%s
-    """, (ip,))
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE incidents
+                SET blocked=true
+                WHERE source_ip=%s
+            """, (ip,))
+            conn.commit()
+        except:
+            pass
+        finally:
+            conn.close()
 
-    conn.commit()
+    return {"blocked": ip}
 
-    return {
-        "blocked": ip
-    }
-
-# ==================================================
-# ELK STATUS
-# ==================================================
-
-@app.get("/api/elk/status")
-def elk_status():
-
-    return {
-        "status": "connected" if es.ping() else "offline",
-        "url": ELASTICSEARCH_URL
-    }
-
-# ==================================================
-# CHAT
-# ==================================================
-
+# =========================
+# CHAT (DEMO)
+# =========================
 @app.post("/api/chat")
 def chat(data: ChatRequest):
 
-    text = data.text
-
     return {
-        "response": f"""
-[XIBAAR AI]
-
-Analyse terminée :
-- Aucun ransomware détecté
-- Aucun brute force actif
-- Niveau de risque : faible
-
-Question:
-{text}
-"""
+        "response": f"[XIBAAR AI] Analyse: {data.text} → OK (demo)"
     }
 
-# ==================================================
+# =========================
 # WEBSOCKET
-# ==================================================
-
+# =========================
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def ws(websocket: WebSocket):
 
     await websocket.accept()
-
-    clients.append(websocket)
+    clients.add(websocket)
 
     try:
         while True:
             await websocket.receive_text()
-
     except WebSocketDisconnect:
-        clients.remove(websocket)
+        clients.discard(websocket)
