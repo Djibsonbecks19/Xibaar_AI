@@ -3,22 +3,27 @@ import time
 from datetime import datetime
 import ctypes
 import sys
+from collections import deque
+import win32evtlog
 
-XIBAAR_URL = "http://localhost:8000/api/events"
+# =========================
+
+# CONFIG (PRODUCTION FIX)
+# =========================
+XIBAAR_URL = "https://xibaar-ai.onrender.com/api/events"
 
 WINDOWS_EVENTS = {
     4625: {"type": "brute_force_attempt", "severity": "HIGH",   "desc": "Échec de connexion"},
     4648: {"type": "suspicious_login",    "severity": "MEDIUM", "desc": "Connexion avec credentials explicites"},
-    4720: {"type": "account_created",     "severity": "HIGH",   "desc": "Nouveau compte créé"},
-    4726: {"type": "account_deleted",     "severity": "HIGH",   "desc": "Compte supprimé"},
-    4732: {"type": "group_modified",      "severity": "MEDIUM", "desc": "Groupe admin modifié"},
-    7045: {"type": "service_installed",   "severity": "HIGH",   "desc": "Nouveau service installé"},
+    4720: {"type": "account_created",      "severity": "HIGH",   "desc": "Nouveau compte créé"},
+    4726: {"type": "account_deleted",      "severity": "HIGH",   "desc": "Compte supprimé"},
+    4732: {"type": "group_modified",       "severity": "MEDIUM", "desc": "Groupe admin modifié"},
+    7045: {"type": "service_installed",    "severity": "HIGH",   "desc": "Nouveau service installé"},
 }
 
-
-# ----------------------------
-# ADMIN CHECK (IMPORTANT FIX)
-# ----------------------------
+# =========================
+# ADMIN CHECK
+# =========================
 def is_admin():
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
@@ -26,15 +31,25 @@ def is_admin():
         return False
 
 
+# =========================
+# SEND EVENT (FIXED)
+# =========================
 def send_event(event_type, severity, description, source_ip="local"):
     try:
-        requests.post(XIBAAR_URL, json={
-            "type": event_type,
-            "source_ip": source_ip,
-            "timestamp": datetime.now().isoformat(),
-            "raw_log": description,
-            "severity": severity
-        }, timeout=5)
+        response = requests.post(
+            XIBAAR_URL,
+            json={
+                "type": event_type,
+                "source_ip": source_ip,
+                "timestamp": datetime.now().isoformat(),
+                "raw_log": description,
+                "severity": severity
+            },
+            timeout=5
+        )
+
+        if response.status_code != 200:
+            print(f"⚠️ Backend error: {response.status_code}")
 
         print(f"⚠️ {datetime.now().strftime('%H:%M:%S')} | {event_type} | {severity}")
 
@@ -42,56 +57,64 @@ def send_event(event_type, severity, description, source_ip="local"):
         print(f"❌ Backend error: {e}")
 
 
+# =========================
+# MONITOR
+# =========================
 def monitor_windows_events():
     if not is_admin():
         print("❌ ERROR: Run as Administrator (required for Security logs)")
         sys.exit(1)
 
-    import win32evtlog
-
-    print("🛡️ XIBAAR Agent started (Windows Event Monitor)")
-    print("📡 Sending to:", XIBAAR_URL)
+    print("🛡️ XIBAAR Agent started")
+    print("📡 Backend:", XIBAAR_URL)
 
     server = "localhost"
     log_type = "Security"
 
     hand = win32evtlog.OpenEventLog(server, log_type)
 
-    flags = win32evtlog.EVENTLOG_BACKWARDS_READ | win32evtlog.EVENTLOG_SEQUENTIAL_READ
+    flags = (
+        win32evtlog.EVENTLOG_BACKWARDS_READ |
+        win32evtlog.EVENTLOG_SEQUENTIAL_READ
+    )
 
-    seen = set()  # FIX: avoid duplicates
+    # FIX: memory-safe duplicate control
+    seen = deque(maxlen=5000)
 
     while True:
-        events = win32evtlog.ReadEventLog(hand, flags, 0)
+        events = win32evtlog.ReadEventLog(hand, flags, 0) or []
 
-        if events:
-            for event in events:
-                event_id = event.EventID & 0xFFFF
+        for event in events:
+            event_id = event.EventID & 0xFFFF
+            event_key = f"{event.RecordNumber}-{event_id}"
 
-                # FIX: prevent spam duplicates
-                event_key = f"{event.RecordNumber}-{event_id}"
-                if event_key in seen:
-                    continue
-                seen.add(event_key)
+            if event_key in seen:
+                continue
 
-                if event_id in WINDOWS_EVENTS:
-                    config = WINDOWS_EVENTS[event_id]
+            seen.append(event_key)
 
-                    hour = datetime.now().hour
-                    severity = config["severity"]
+            if event_id in WINDOWS_EVENTS:
+                config = WINDOWS_EVENTS[event_id]
 
-                    if hour < 6 or hour > 22:
-                        severity = "HIGH"
+                hour = datetime.now().hour
+                severity = config["severity"]
 
-                    send_event(
-                        config["type"],
-                        severity,
-                        f"EventID {event_id} — {config['desc']}"
-                    )
+                # boost severity at night (suspicious behavior)
+                if hour < 6 or hour > 22:
+                    severity = "HIGH"
+
+                send_event(
+                    config["type"],
+                    severity,
+                    f"EventID {event_id} — {config['desc']}"
+                )
 
         time.sleep(2)
 
 
+# =========================
+# MAIN
+# =========================
 if __name__ == "__main__":
     print("=" * 50)
     print("   🛡️ XIBAAR AI Agent Windows")
