@@ -39,14 +39,14 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:18
+    image: postgres:16
     container_name: xibaar-postgres
     environment:
       POSTGRES_DB: postgres
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: sonbeckscoding
     ports:
-      - "5434:5432"
+      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     networks:
@@ -67,7 +67,7 @@ services:
       - .env
     environment:
       - ELASTICSEARCH_URL=http://elasticsearch:9200
-      - DATABASE_URL=postgresql://postgres:sonbeckscoding@postgres:5434/postgres
+      - DATABASE_URL=postgresql://postgres:sonbeckscoding@postgres:5432/postgres
     depends_on:
       elasticsearch:
         condition: service_healthy
