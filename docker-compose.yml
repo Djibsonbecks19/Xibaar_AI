@@ -39,7 +39,7 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:15
+    image: postgres:18
     container_name: xibaar-postgres
     environment:
       POSTGRES_DB: postgres
