@@ -42,9 +42,9 @@ services:
     image: postgres:15
     container_name: xibaar-postgres
     environment:
-      POSTGRES_DB: xibaar
-      POSTGRES_USER: xibaar
-      POSTGRES_PASSWORD: xibaar123
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: sonbeckscoding
     ports:
       - "5432:5432"
     volumes:
