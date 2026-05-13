@@ -17,10 +17,9 @@ app.add_middleware(
 )
 
 # =========================
-# OPTIONAL SERVICES
+# OPTIONAL ELASTICSEARCH
 # =========================
 es = None
-
 try:
     from elasticsearch import Elasticsearch
     ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL")
@@ -30,11 +29,10 @@ except:
     es = None
 
 # =========================
-# IN-MEMORY DATABASE (FIX)
+# MEMORY STORAGE
 # =========================
 incidents = []
 events_store = []
-
 clients = set()
 
 # =========================
@@ -69,17 +67,15 @@ def health():
 
 
 # =========================
-# EVENTS (CORE FIXED)
+# EVENTS (POST)
 # =========================
 @app.post("/api/events")
 async def create_event(event: EventModel):
 
     data = event.dict()
 
-    # store event
     events_store.append(data)
 
-    # convert to incident (IMPORTANT FIX)
     incident = {
         **data,
         "id": len(incidents) + 1,
@@ -90,21 +86,21 @@ async def create_event(event: EventModel):
 
     incidents.append(incident)
 
-    # send to elasticsearch if available
+    # Elasticsearch (optional)
     if es:
         try:
             es.index(index="xibaar-events", document=data)
         except Exception as e:
             print("ES error:", e)
 
-    # websocket broadcast (FIXED FORMAT)
+    # WebSocket broadcast (FIXED)
     dead = set()
 
     for c in clients:
         try:
             await c.send_json({
                 "type": "new_event",
-                "event": data
+                "data": data   # ✅ FIXED (frontend expects .data)
             })
         except:
             dead.add(c)
@@ -116,7 +112,15 @@ async def create_event(event: EventModel):
 
 
 # =========================
-# INCIDENTS (FIXED)
+# EVENTS (GET FIX - IMPORTANT)
+# =========================
+@app.get("/api/events")
+def get_events():
+    return events_store
+
+
+# =========================
+# INCIDENTS
 # =========================
 @app.get("/api/incidents")
 def get_incidents():
@@ -124,7 +128,7 @@ def get_incidents():
 
 
 # =========================
-# STATS (FIXED)
+# STATS
 # =========================
 @app.get("/api/stats")
 def get_stats():
@@ -142,7 +146,7 @@ def get_stats():
 
 
 # =========================
-# BLOCK IP (FIXED)
+# BLOCK IP
 # =========================
 @app.post("/api/block-ip/{ip}")
 def block_ip(ip: str):
@@ -156,7 +160,7 @@ def block_ip(ip: str):
 
 
 # =========================
-# CHAT (OK)
+# CHAT
 # =========================
 @app.post("/api/chat")
 def chat(data: ChatRequest):
@@ -166,7 +170,7 @@ def chat(data: ChatRequest):
 
 
 # =========================
-# ELK STATUS (FIXED)
+# ELK STATUS
 # =========================
 @app.get("/api/elk/status")
 def elk_status():
@@ -177,7 +181,7 @@ def elk_status():
 
 
 # =========================
-# ELK SEARCH (FIXED SAFE)
+# ELK SEARCH
 # =========================
 @app.get("/api/elk/search")
 def elk_search(q: str = "*", size: int = 20):
@@ -192,10 +196,7 @@ def elk_search(q: str = "*", size: int = 20):
             size=size
         )
 
-        return [
-            hit["_source"]
-            for hit in res["hits"]["hits"]
-        ]
+        return [hit["_source"] for hit in res["hits"]["hits"]]
 
     except Exception as e:
         print("ELK error:", e)
@@ -203,7 +204,7 @@ def elk_search(q: str = "*", size: int = 20):
 
 
 # =========================
-# WEBSOCKET (FIXED)
+# WEBSOCKET
 # =========================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
