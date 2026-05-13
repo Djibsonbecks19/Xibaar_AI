@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import os
 
 # =========================
-# APP INIT (ALWAYS SAFE)
+# APP INIT
 # =========================
 app = FastAPI(title="XIBAAR AI")
 
@@ -17,48 +17,25 @@ app.add_middleware(
 )
 
 # =========================
-# SAFE OPTIONAL IMPORTS
+# OPTIONAL SERVICES
 # =========================
 es = None
-db_error = None
 
-# try elasticsearch safely
 try:
     from elasticsearch import Elasticsearch
     ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL")
-
     if ELASTICSEARCH_URL:
         es = Elasticsearch(ELASTICSEARCH_URL)
-
-except Exception as e:
-    print("Elasticsearch disabled:", e)
+except:
     es = None
 
-# try postgres safely
-try:
-    import psycopg2
-except Exception as e:
-    print("Postgres disabled:", e)
-    psycopg2 = None
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-
-def get_db():
-    if not DATABASE_URL or not psycopg2:
-        return None
-    try:
-        return psycopg2.connect(DATABASE_URL)
-    except Exception as e:
-        print("DB connect error:", e)
-        return None
-
-
 # =========================
-# WEBSOCKETS
+# IN-MEMORY DATABASE (FIX)
 # =========================
+incidents = []
+events_store = []
+
 clients = set()
-
 
 # =========================
 # MODELS
@@ -76,7 +53,7 @@ class ChatRequest(BaseModel):
 
 
 # =========================
-# ROOT (CRITICAL HEALTH CHECK)
+# HEALTH
 # =========================
 @app.get("/")
 def root():
@@ -86,43 +63,49 @@ def root():
     }
 
 
-# =========================
-# SIMPLE TEST ENDPOINT
-# =========================
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
 # =========================
-# EVENTS (SAFE MODE)
+# EVENTS (CORE FIXED)
 # =========================
 @app.post("/api/events")
 async def create_event(event: EventModel):
 
     data = event.dict()
 
-    # ES safe
+    # store event
+    events_store.append(data)
+
+    # convert to incident (IMPORTANT FIX)
+    incident = {
+        **data,
+        "id": len(incidents) + 1,
+        "blocked": False,
+        "status": "OPEN",
+        "ai_analysis": {}
+    }
+
+    incidents.append(incident)
+
+    # send to elasticsearch if available
     if es:
         try:
             es.index(index="xibaar-events", document=data)
         except Exception as e:
             print("ES error:", e)
 
-    # DB safe
-    conn = get_db()
-    if conn:
-        try:
-            conn.close()
-        except:
-            pass
-
-    # websocket safe
+    # websocket broadcast (FIXED FORMAT)
     dead = set()
 
     for c in clients:
         try:
-            await c.send_json({"type": "new_event", "data": data})
+            await c.send_json({
+                "type": "new_event",
+                "event": data
+            })
         except:
             dead.add(c)
 
@@ -133,18 +116,97 @@ async def create_event(event: EventModel):
 
 
 # =========================
-# CHAT (SAFE)
+# INCIDENTS (FIXED)
+# =========================
+@app.get("/api/incidents")
+def get_incidents():
+    return incidents
+
+
+# =========================
+# STATS (FIXED)
+# =========================
+@app.get("/api/stats")
+def get_stats():
+
+    total = len(incidents)
+    blocked = len([i for i in incidents if i.get("blocked")])
+    critiques = len([i for i in incidents if i.get("severity") == "HIGH"])
+
+    return {
+        "total_incidents": total,
+        "total_events": len(events_store),
+        "ips_bloquees": blocked,
+        "critiques": critiques
+    }
+
+
+# =========================
+# BLOCK IP (FIXED)
+# =========================
+@app.post("/api/block-ip/{ip}")
+def block_ip(ip: str):
+
+    for i in incidents:
+        if i["source_ip"] == ip:
+            i["blocked"] = True
+            i["status"] = "RESOLVED"
+
+    return {"ok": True}
+
+
+# =========================
+# CHAT (OK)
 # =========================
 @app.post("/api/chat")
 def chat(data: ChatRequest):
-    return {"response": f"[XIBAAR AI] OK: {data.text}"}
+    return {
+        "response": f"[XIBAAR AI] OK: {data.text}"
+    }
 
 
 # =========================
-# WEBSOCKET SAFE
+# ELK STATUS (FIXED)
+# =========================
+@app.get("/api/elk/status")
+def elk_status():
+    return {
+        "status": "connected" if es else "disconnected",
+        "version": "8.x" if es else None
+    }
+
+
+# =========================
+# ELK SEARCH (FIXED SAFE)
+# =========================
+@app.get("/api/elk/search")
+def elk_search(q: str = "*", size: int = 20):
+
+    if not es:
+        return []
+
+    try:
+        res = es.search(
+            index="xibaar-events",
+            query={"query_string": {"query": q}},
+            size=size
+        )
+
+        return [
+            hit["_source"]
+            for hit in res["hits"]["hits"]
+        ]
+
+    except Exception as e:
+        print("ELK error:", e)
+        return []
+
+
+# =========================
+# WEBSOCKET (FIXED)
 # =========================
 @app.websocket("/ws")
-async def ws(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket):
 
     await websocket.accept()
     clients.add(websocket)
