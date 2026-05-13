@@ -1,22 +1,20 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from dotenv import load_dotenv
 from elasticsearch import Elasticsearch
+from dotenv import load_dotenv
+import psycopg2
 import os
 import uuid
 
-# =========================
-# LOAD ENV
-# =========================
 load_dotenv()
 
-ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+# =========================
+# ENV
+# =========================
+ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# =========================
-# APP
-# =========================
 app = FastAPI(title="XIBAAR AI")
 
 app.add_middleware(
@@ -28,41 +26,35 @@ app.add_middleware(
 )
 
 # =========================
-# SAFE OPTIONAL IMPORTS
-# =========================
-try:
-    import psycopg2
-except Exception as e:
-    print("psycopg2 not available:", e)
-    psycopg2 = None
-
-# =========================
-# SAFE ELASTICSEARCH INIT
+# SAFE ELASTICSEARCH
 # =========================
 es = None
-try:
-    if ELASTICSEARCH_URL:
+if ELASTICSEARCH_URL:
+    try:
         es = Elasticsearch(ELASTICSEARCH_URL)
-except Exception as e:
-    print("Elasticsearch init failed:", e)
-    es = None
+    except Exception as e:
+        print("ES ERROR:", e)
+        es = None
+
 
 # =========================
 # DB SAFE CONNECT
 # =========================
 def get_db():
-    if not DATABASE_URL or not psycopg2:
+    if not DATABASE_URL:
         return None
     try:
         return psycopg2.connect(DATABASE_URL)
     except Exception as e:
-        print("DB connection failed:", e)
+        print("DB CONNECT ERROR:", e)
         return None
+
 
 # =========================
 # WEBSOCKETS
 # =========================
 clients = set()
+
 
 # =========================
 # MODELS
@@ -74,8 +66,10 @@ class EventModel(BaseModel):
     raw_log: str
     severity: str
 
+
 class ChatRequest(BaseModel):
     text: str
+
 
 # =========================
 # ROOT
@@ -84,54 +78,54 @@ class ChatRequest(BaseModel):
 def root():
     return {
         "status": "XIBAAR AI running",
-        "elasticsearch": bool(es and hasattr(es, "ping") and es.ping())
+        "elasticsearch": es.ping() if es else False
     }
 
+
 # =========================
-# CREATE EVENT
+# EVENTS
 # =========================
 @app.post("/api/events")
 async def create_event(event: EventModel):
 
     data = event.dict()
 
-    # ELASTIC SAFE
+    # ES
     if es:
         try:
             es.index(index="xibaar-events", document=data)
         except Exception as e:
-            print("Elastic insert error:", e)
+            print("ES INDEX ERROR:", e)
 
-    # POSTGRES SAFE
+    # DB
     conn = get_db()
     if conn:
         try:
-            cur = conn.cursor()
+            with conn.cursor() as cur:
 
-            if data["severity"] == "HIGH":
-                incident_id = str(uuid.uuid4())
+                if data["severity"] == "HIGH":
 
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS incidents (
-                        id TEXT PRIMARY KEY,
-                        type TEXT,
-                        source_ip TEXT,
-                        severity TEXT,
-                        blocked BOOLEAN,
-                        timestamp TEXT
-                    )
-                """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS incidents (
+                            id TEXT PRIMARY KEY,
+                            type TEXT,
+                            source_ip TEXT,
+                            severity TEXT,
+                            blocked BOOLEAN,
+                            timestamp TEXT
+                        )
+                    """)
 
-                cur.execute("""
-                    INSERT INTO incidents VALUES (%s,%s,%s,%s,%s,%s)
-                """, (
-                    incident_id,
-                    data["type"],
-                    data["source_ip"],
-                    data["severity"],
-                    False,
-                    data["timestamp"]
-                ))
+                    cur.execute("""
+                        INSERT INTO incidents VALUES (%s,%s,%s,%s,%s,%s)
+                    """, (
+                        str(uuid.uuid4()),
+                        data["type"],
+                        data["source_ip"],
+                        data["severity"],
+                        False,
+                        data["timestamp"]
+                    ))
 
                 conn.commit()
 
@@ -141,15 +135,12 @@ async def create_event(event: EventModel):
         finally:
             conn.close()
 
-    # WEBSOCKET BROADCAST
+    # WS broadcast
     dead = set()
 
     for client in clients:
         try:
-            await client.send_json({
-                "type": "new_event",
-                "event": data
-            })
+            await client.send_json({"type": "new_event", "data": data})
         except:
             dead.add(client)
 
@@ -158,8 +149,9 @@ async def create_event(event: EventModel):
 
     return {"ok": True}
 
+
 # =========================
-# GET EVENTS (ELASTIC)
+# GET EVENTS
 # =========================
 @app.get("/api/events")
 def get_events():
@@ -169,12 +161,13 @@ def get_events():
 
     try:
         results = es.search(index="xibaar-events", size=50)
-        return [hit["_source"] for hit in results["hits"]["hits"]]
+        return [h["_source"] for h in results["hits"]["hits"]]
     except:
         return []
 
+
 # =========================
-# INCIDENTS (POSTGRES)
+# INCIDENTS
 # =========================
 @app.get("/api/incidents")
 def get_incidents():
@@ -184,9 +177,9 @@ def get_incidents():
         return []
 
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM incidents ORDER BY timestamp DESC")
-        rows = cur.fetchall()
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM incidents ORDER BY timestamp DESC")
+            rows = cur.fetchall()
 
         return [
             {
@@ -201,11 +194,12 @@ def get_incidents():
         ]
 
     except Exception as e:
-        print("Incidents error:", e)
+        print("DB ERROR:", e)
         return []
 
     finally:
         conn.close()
+
 
 # =========================
 # STATS
@@ -218,19 +212,20 @@ def stats():
     conn = get_db()
     if conn:
         try:
-            cur = conn.cursor()
+            with conn.cursor() as cur:
 
-            cur.execute("SELECT COUNT(*) FROM incidents")
-            total_incidents = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM incidents")
+                total_incidents = cur.fetchone()[0]
 
-            cur.execute("SELECT COUNT(*) FROM incidents WHERE severity='HIGH'")
-            critiques = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM incidents WHERE severity='HIGH'")
+                critiques = cur.fetchone()[0]
 
-            cur.execute("SELECT COUNT(*) FROM incidents WHERE blocked=true")
-            ips_bloquees = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM incidents WHERE blocked=true")
+                ips_bloquees = cur.fetchone()[0]
 
-        except:
-            pass
+        except Exception as e:
+            print("DB ERROR:", e)
+
         finally:
             conn.close()
 
@@ -248,6 +243,7 @@ def stats():
         "ips_bloquees": ips_bloquees
     }
 
+
 # =========================
 # BLOCK IP
 # =========================
@@ -257,29 +253,28 @@ def block_ip(ip: str):
     conn = get_db()
     if conn:
         try:
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE incidents
-                SET blocked=true
-                WHERE source_ip=%s
-            """, (ip,))
-            conn.commit()
-        except:
-            pass
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE incidents
+                    SET blocked=true
+                    WHERE source_ip=%s
+                """, (ip,))
+                conn.commit()
+        except Exception as e:
+            print("DB ERROR:", e)
         finally:
             conn.close()
 
     return {"blocked": ip}
 
+
 # =========================
-# CHAT (DEMO)
+# CHAT
 # =========================
 @app.post("/api/chat")
 def chat(data: ChatRequest):
+    return {"response": f"[XIBAAR AI] Analyse: {data.text} → OK"}
 
-    return {
-        "response": f"[XIBAAR AI] Analyse: {data.text} → OK (demo)"
-    }
 
 # =========================
 # WEBSOCKET
@@ -293,5 +288,6 @@ async def ws(websocket: WebSocket):
     try:
         while True:
             await websocket.receive_text()
+
     except WebSocketDisconnect:
         clients.discard(websocket)
