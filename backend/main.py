@@ -1,12 +1,13 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from datetime import datetime
 import os
 
 # =========================
 # APP INIT
 # =========================
-app = FastAPI(title="XIBAAR AI")
+app = FastAPI(title="XIBAAR AI SOC")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,22 +18,19 @@ app.add_middleware(
 )
 
 # =========================
-# OPTIONAL ELASTICSEARCH
+# ELASTICSEARCH (OPTIONAL BUT PRIMARY)
 # =========================
 es = None
 try:
     from elasticsearch import Elasticsearch
-    ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL")
-    if ELASTICSEARCH_URL:
-        es = Elasticsearch(ELASTICSEARCH_URL)
+    ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
+    es = Elasticsearch(ELASTICSEARCH_URL)
 except:
     es = None
 
 # =========================
-# MEMORY STORAGE
+# MEMORY (FALLBACK ONLY)
 # =========================
-incidents = []
-events_store = []
 clients = set()
 
 # =========================
@@ -41,7 +39,7 @@ clients = set()
 class EventModel(BaseModel):
     type: str
     source_ip: str
-    timestamp: str
+    timestamp: str | None = None
     raw_log: str
     severity: str
 
@@ -51,12 +49,12 @@ class ChatRequest(BaseModel):
 
 
 # =========================
-# HEALTH
+# ROOT
 # =========================
 @app.get("/")
 def root():
     return {
-        "status": "XIBAAR AI running",
+        "status": "XIBAAR SOC API",
         "elasticsearch": es is not None
     }
 
@@ -67,40 +65,46 @@ def health():
 
 
 # =========================
-# EVENTS (POST)
+# EVENT INGESTION (MAIN FIX)
 # =========================
 @app.post("/api/events")
 async def create_event(event: EventModel):
 
-    data = event.dict()
+    timestamp = event.timestamp or datetime.utcnow().isoformat()
 
-    events_store.append(data)
-
-    incident = {
-        **data,
-        "id": len(incidents) + 1,
-        "blocked": False,
-        "status": "OPEN",
-        "ai_analysis": {}
+    log = {
+        "type": event.type,
+        "source_ip": event.source_ip,
+        "timestamp": timestamp,
+        "raw_log": event.raw_log,
+        "severity": event.severity
     }
 
-    incidents.append(incident)
-
-    # Elasticsearch (optional)
+    # =========================
+    # SEND TO LOGSTASH/ELK (PRIMARY PIPELINE)
+    # =========================
     if es:
         try:
-            es.index(index="xibaar-events", document=data)
-        except Exception as e:
-            print("ES error:", e)
+            index_name = f"xibaar-logs-{datetime.utcnow().strftime('%Y.%m.%d')}"
 
-    # WebSocket broadcast (FIXED)
+            es.index(
+                index=index_name,
+                document=log
+            )
+
+        except Exception as e:
+            print("ELK ERROR:", e)
+
+    # =========================
+    # REAL-TIME WEBSOCKET BROADCAST
+    # =========================
     dead = set()
 
     for c in clients:
         try:
             await c.send_json({
                 "type": "new_event",
-                "data": data   # ✅ FIXED (frontend expects .data)
+                "data": log
             })
         except:
             dead.add(c)
@@ -108,64 +112,137 @@ async def create_event(event: EventModel):
     for d in dead:
         clients.discard(d)
 
-    return {"ok": True}
+    return {"ok": True, "stored": log}
 
 
 # =========================
-# EVENTS (GET FIX - IMPORTANT)
+# EVENTS (READ FROM ELK - FIXED)
 # =========================
 @app.get("/api/events")
-def get_events():
-    return events_store
+def get_events(size: int = 50):
+
+    if not es:
+        return {"error": "Elasticsearch not connected"}
+
+    try:
+        res = es.search(
+            index="xibaar-logs-*",
+            size=size,
+            query={"match_all": {}},
+            sort=[{"timestamp": {"order": "desc"}}]
+        )
+
+        return [hit["_source"] for hit in res["hits"]["hits"]]
+
+    except Exception as e:
+        print("ELK READ ERROR:", e)
+        return []
 
 
 # =========================
-# INCIDENTS
+# INCIDENTS (DERIVED FROM ELK LOGIC)
 # =========================
 @app.get("/api/incidents")
 def get_incidents():
-    return incidents
+
+    if not es:
+        return []
+
+    try:
+        res = es.search(
+            index="xibaar-logs-*",
+            size=100,
+            query={
+                "bool": {
+                    "should": [
+                        {"match": {"severity": "HIGH"}},
+                        {"match": {"type": "brute_force"}},
+                        {"match": {"type": "port_scan"}},
+                        {"match": {"type": "sql_injection"}}
+                    ]
+                }
+            }
+        )
+
+        incidents = []
+        for i, hit in enumerate(res["hits"]["hits"]):
+            src = hit["_source"]
+
+            incidents.append({
+                "id": i + 1,
+                "type": src.get("type"),
+                "source_ip": src.get("source_ip"),
+                "timestamp": src.get("timestamp"),
+                "severity": src.get("severity"),
+                "blocked": False,
+                "status": "OPEN",
+                "raw_log": src.get("raw_log")
+            })
+
+        return incidents
+
+    except Exception as e:
+        print("INCIDENT ERROR:", e)
+        return []
 
 
 # =========================
-# STATS
+# STATS (FROM ELK)
 # =========================
 @app.get("/api/stats")
 def get_stats():
 
-    total = len(incidents)
-    blocked = len([i for i in incidents if i.get("blocked")])
-    critiques = len([i for i in incidents if i.get("severity") == "HIGH"])
+    if not es:
+        return {
+            "total_incidents": 0,
+            "total_events": 0,
+            "ips_bloquees": 0,
+            "critiques": 0
+        }
 
-    return {
-        "total_incidents": total,
-        "total_events": len(events_store),
-        "ips_bloquees": blocked,
-        "critiques": critiques
-    }
+    try:
+        res = es.search(
+            index="xibaar-logs-*",
+            size=0,
+            query={"match_all": {}},
+            aggs={
+                "critical": {
+                    "filter": {"match": {"severity": "HIGH"}}
+                }
+            }
+        )
+
+        return {
+            "total_incidents": res["hits"]["total"]["value"],
+            "total_events": res["hits"]["total"]["value"],
+            "ips_bloquees": 0,
+            "critiques": res["aggregations"]["critical"]["doc_count"]
+        }
+
+    except Exception as e:
+        print("STATS ERROR:", e)
+        return {}
 
 
 # =========================
-# BLOCK IP
+# BLOCK IP (SOFT VERSION)
 # =========================
 @app.post("/api/block-ip/{ip}")
 def block_ip(ip: str):
 
-    for i in incidents:
-        if i["source_ip"] == ip:
-            i["blocked"] = True
-            i["status"] = "RESOLVED"
+    # In real SOC → firewall / Windows Defender / iptables
+    print(f"[BLOCKED IP] {ip}")
 
-    return {"ok": True}
+    return {"ok": True, "ip": ip}
 
 
 # =========================
-# CHAT
+# CHAT (AI PLACEHOLDER)
 # =========================
 @app.post("/api/chat")
 def chat(data: ChatRequest):
     return {
-        "response": f"[XIBAAR AI] OK: {data.text}"
+        "response": f"[XIBAAR AI SOC] Analyse: {data.text}"
     }
 
 
@@ -174,46 +251,31 @@ def chat(data: ChatRequest):
 # =========================
 @app.get("/api/elk/status")
 def elk_status():
-    return {
-        "status": "connected" if es else "disconnected",
-        "version": "8.x" if es else None
-    }
-
-
-# =========================
-# ELK SEARCH
-# =========================
-@app.get("/api/elk/search")
-def elk_search(q: str = "*", size: int = 20):
 
     if not es:
-        return []
+        return {"status": "disconnected"}
 
     try:
-        res = es.search(
-            index="xibaar-events",
-            query={"query_string": {"query": q}},
-            size=size
-        )
-
-        return [hit["_source"] for hit in res["hits"]["hits"]]
-
-    except Exception as e:
-        print("ELK error:", e)
-        return []
+        info = es.info()
+        return {
+            "status": "connected",
+            "version": info.get("version", {}).get("number")
+        }
+    except:
+        return {"status": "error"}
 
 
 # =========================
 # WEBSOCKET
 # =========================
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def ws_endpoint(ws: WebSocket):
 
-    await websocket.accept()
-    clients.add(websocket)
+    await ws.accept()
+    clients.add(ws)
 
     try:
         while True:
-            await websocket.receive_text()
+            await ws.receive_text()
     except WebSocketDisconnect:
-        clients.discard(websocket)
+        clients.discard(ws)

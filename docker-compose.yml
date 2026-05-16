@@ -39,14 +39,14 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:16
+    image: postgres:18
     container_name: xibaar-postgres
     environment:
       POSTGRES_DB: postgres
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: sonbeckscoding
     ports:
-      - "5432:5432"
+      - "5434:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     networks:
